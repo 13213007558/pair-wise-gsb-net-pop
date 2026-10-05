@@ -42,6 +42,25 @@ module Net
   # Unexpected response from the server.
   class POPBadResponse < POPError; end
 
+  # UIDL is unavailable or unusable on the POP server.
+  class POPUIDLUnavailable < POPError; end
+
+  # A resumable POP3 reconciliation could not be completed safely.
+  class POPReconciliationError < POPError
+    def initialize(message, result = nil)
+      super(message)
+      @result = result
+    end
+
+    attr_reader :result
+  end
+
+  # The UIDL list contains the same unique-id more than once.
+  class POPDuplicateUIDLError < POPReconciliationError; end
+
+  # A message previously confirmed by the caller is no longer present.
+  class POPMissingMailError < POPReconciliationError; end
+
   #
   # == What is This Library?
   #
@@ -430,6 +449,8 @@ module Net
       @mails = nil
       @n_mails = nil
       @n_bytes = nil
+      @quit_response = nil
+      @quit_attempted = false
     end
 
     # Does this instance use APOP authentication?
@@ -597,7 +618,7 @@ module Net
       @mails = nil
       @n_mails = nil
       @n_bytes = nil
-      @command.quit if @command
+      @quit_response = quit unless @quit_attempted
     ensure
       @started = false
       @command = nil
@@ -615,6 +636,41 @@ module Net
       @command
     end
     private :command
+
+    # Sends QUIT and returns the server's response.
+    #
+    # Unlike #finish, this method leaves the POP3 object in its started state.
+    # Call #finish afterwards to release the socket.
+    def quit
+      raise IOError, 'POP session not yet started' unless started?
+      if @quit_attempted
+        return @quit_response
+      end
+      @quit_attempted = true
+      @quit_response = command.quit
+    end
+
+    # Closes the socket without sending QUIT.
+    #
+    # Use this after a protocol error or an interrupted command where it is
+    # not safe to assume server-side deletion has been committed.
+    def abort
+      raise IOError, 'POP session not yet started' unless started?
+      do_abort
+    end
+
+    def do_abort # :nodoc:
+      @mails = nil
+      @n_mails = nil
+      @n_bytes = nil
+    ensure
+      @started = false
+      @quit_attempted = true
+      @command = nil
+      @socket.close if @socket
+      @socket = nil
+    end
+    private :do_abort
 
     #
     # POP protocol wrapper
@@ -706,6 +762,14 @@ module Net
     def set_all_uids   #:nodoc: internal use only (called from POPMail#uidl)
       uidl = command().uidl
       @mails.each {|m| m.uid = uidl[m.number] }
+    end
+
+    # Returns the current UIDL table as a hash of message number to UIDL.
+    #
+    # The message number is only valid for the current POP3 session; use the
+    # UIDL as the persistent message identity across reconnects.
+    def uidl_table
+      command.uidl
     end
 
     # debugging output for +msg+
@@ -884,6 +948,361 @@ module Net
     end
 
   end   # class POPMail
+
+  # Result of reconciling the current POP3 message numbers with UIDLs and a
+  # caller-provided checkpoint store.
+  class POP3UIDLReconciliation
+    def initialize(uidls, messages, missing_confirmed, duplicates,
+                   pending_deletion_messages)
+      @uidls = uidls
+      @messages = messages
+      @missing_confirmed = missing_confirmed
+      @duplicates = duplicates
+      @pending_deletion_messages = pending_deletion_messages
+    end
+
+    attr_reader :uidls, :messages, :missing_confirmed, :duplicates,
+                :pending_deletion_messages
+
+    def downloaded_messages
+      @messages.select(&:downloaded?)
+    end
+
+    def confirmed_messages
+      @messages.select(&:confirmed?)
+    end
+
+    # Messages which have not yet been completely downloaded.
+    def new_messages
+      @messages.reject {|message| message.downloaded? || message.confirmed? }
+    end
+
+    # Downloaded messages which the caller has not confirmed yet.
+    def unconfirmed_messages
+      @messages.select {|message| message.downloaded? && !message.confirmed? }
+    end
+  end
+
+  # A UIDL-identified message in one POP3 connection. The wrapped POPMail's
+  # number must not be reused after the connection is reopened.
+  class POP3ResumableMessage
+    def initialize(mail, storage)
+      @mail = mail
+      @storage = storage
+    end
+
+    attr_reader :mail
+
+    def unique_id
+      @mail.unique_id
+    end
+
+    alias uidl unique_id
+
+    def number
+      @mail.number
+    end
+
+    def length
+      @mail.length
+    end
+
+    alias size length
+
+    def downloaded?
+      @storage.downloaded?(unique_id)
+    end
+
+    def confirmed?
+      @storage.confirmed_uids.map(&:to_s).include?(unique_id)
+    end
+
+    # Retrieves the message and yields complete protocol chunks to the block.
+    # The download checkpoint is marked only after the block returns normally
+    # and the full RETR response has been received.
+    def download(&block)
+      raise ArgumentError, 'a block is required to persist downloaded chunks' \
+        unless block
+      @mail.pop(&block)
+      @storage.mark_downloaded(unique_id)
+      self
+    end
+  end
+
+  # One reconciled POP3 connection. Do not retain message numbers after this
+  # round is closed or reopened.
+  class POP3ResumableRound
+    def initialize(pop, storage)
+      @pop = pop
+      @storage = storage
+      @requested_deletion_uids = []
+      @closed = false
+      @deletion_committed = false
+      @quit_attempted = false
+      @pending_deletion_uids = Array(storage.deletion_pending_uids)
+      begin
+        @result = reconcile
+      rescue Exception
+        @closed = true
+        begin
+          @pop.abort if @pop.started?
+        rescue StandardError
+        end
+        raise
+      end
+    end
+
+    attr_reader :result
+
+    def messages
+      @result.messages
+    end
+
+    def new_messages
+      @result.new_messages
+    end
+
+    def downloaded_messages
+      @result.downloaded_messages
+    end
+
+    def confirmed_messages
+      @result.confirmed_messages
+    end
+
+    def active?
+      !@closed && @pop.started?
+    end
+
+    # Sends DELE for every confirmed UIDL currently visible on the server.
+    # DELE success is recorded only as a deletion request. Server-side deletion
+    # is not committed until #commit succeeds in sending QUIT and receiving
+    # +OK.
+    def commit_confirmed
+      request_confirmed_deletions
+      commit_requested_deletions
+    end
+
+    # Sends DELE for confirmed messages without sending QUIT. The deletion is
+    # only marked locally and can still be withdrawn with RSET or abort.
+    def request_confirmed_deletions
+      confirmed_messages.each do |message|
+        message.mail.delete
+        uid = message.unique_id
+        @storage.mark_deletion_requested(uid)
+        @requested_deletion_uids << uid
+      end
+      nil
+    rescue StandardError
+      abort
+      raise
+    end
+
+    # Commits DELE marks from this round with QUIT. A failed QUIT or disconnect
+    # withdraws the local deletion state instead of reporting success.
+    def commit_requested_deletions
+      @quit_attempted = true
+      response = @pop.quit
+      @deletion_committed = true
+      finish
+      @storage.mark_deletion_committed(@requested_deletion_uids.dup)
+      response
+    rescue StandardError
+      abort unless @deletion_committed
+      raise
+    end
+
+    # Sends RSET and withdraws the local deletion requests made in this round.
+    def reset_deletions
+      @pop.reset
+      @storage.rollback_deletion_requests(Array(@storage.deletion_pending_uids))
+      @requested_deletion_uids.clear
+      nil
+    end
+
+    # Closes the connection normally. If DELE was sent without a successful
+    # QUIT, use #abort instead so local deletion state is withdrawn.
+    def close
+      return nil unless active?
+      @pop.finish
+      nil
+    ensure
+      @closed = true
+    end
+
+    # Closes without QUIT and withdraws local deletion requests. Use this for
+    # RSET-equivalent recovery after an abnormal disconnect or protocol error.
+    def abort
+      unless @deletion_committed
+        begin
+          rollback_requested_deletions unless @quit_attempted
+        ensure
+          @pop.abort if @pop.started?
+        end
+      end
+    ensure
+      @closed = true
+    end
+
+    private
+
+    def reconcile
+      uidls = @pop.uidl_table
+      mails = @pop.mails
+      normalized_uidls = {}
+      invalid_uids = []
+
+      mails.each do |mail|
+        uid = uidls[mail.number]
+        if uid.nil? || uid.empty?
+          invalid_uids << mail.number
+        else
+          mail.uid = uid
+          normalized_uidls[mail.number] = uid
+        end
+      end
+
+      unexpected_numbers = uidls.keys - mails.map(&:number)
+      unless unexpected_numbers.empty?
+        raise POPUIDLUnavailable,
+              "UIDL response contains unexpected message number(s) #{unexpected_numbers.join(', ')}"
+      end
+
+      duplicates = normalized_uidls.values.group_by(&:itself)
+                                       .select {|_, values| values.length > 1 }
+                                       .keys
+      present_uids = normalized_uidls.values
+      disappeared_pending = @pending_deletion_uids - present_uids
+      remaining_pending = @pending_deletion_uids & present_uids
+      confirmed_uids = Array(@storage.confirmed_uids).map(&:to_s)
+      missing_confirmed = (confirmed_uids - present_uids) - disappeared_pending
+      @confirmed_uids = confirmed_uids
+      messages = mails.map {|mail| POP3ResumableMessage.new(mail, @storage) }
+      pending_messages = messages.select do |message|
+        @pending_deletion_uids.include?(message.unique_id)
+      end
+      result = POP3UIDLReconciliation.new(normalized_uidls, messages,
+                                          missing_confirmed, duplicates,
+                                          pending_messages)
+
+      unless invalid_uids.empty?
+        raise POPUIDLUnavailable,
+              "UIDL response is missing or invalid for message(s) #{invalid_uids.join(', ')}"
+      end
+      unless duplicates.empty?
+        raise POPDuplicateUIDLError.new(
+          "duplicate UIDL value(s): #{duplicates.join(', ')}", result
+        )
+      end
+      unless missing_confirmed.empty?
+        raise POPMissingMailError.new(
+          "confirmed message(s) disappeared: #{missing_confirmed.join(', ')}", result
+        )
+      end
+
+      @storage.mark_deletion_committed(disappeared_pending) \
+        unless disappeared_pending.empty?
+      @storage.rollback_deletion_requests(remaining_pending) \
+        unless remaining_pending.empty?
+      result
+    rescue POPReconciliationError, POPUIDLUnavailable
+      @closed = true
+      raise
+    rescue POPError
+      @closed = true
+      raise POPUIDLUnavailable, 'UIDL is unavailable on this POP server'
+    end
+
+    def rollback_requested_deletions
+      uids = @requested_deletion_uids.dup
+      @storage.rollback_deletion_requests(uids) unless uids.empty?
+      @requested_deletion_uids.clear
+    end
+
+    def finish
+      @pop.finish
+    ensure
+      @closed = true
+    end
+  end
+
+  # A reconnecting POP3 receiving session keyed by UIDL. The supplied block
+  # must return a started Net::POP3 instance for each connection attempt.
+  #
+  # The storage object is supplied by the caller and must implement:
+  #
+  # - confirmed_uids
+  # - downloaded?(uid)
+  # - mark_downloaded(uid)
+  # - deletion_pending_uids
+  # - mark_deletion_requested(uid)
+  # - rollback_deletion_requests(uids)
+  # - mark_deletion_committed(uids)
+  class POP3ResumableSession
+    def initialize(storage, max_rounds: 2, &connection_factory)
+      raise ArgumentError, 'a connection factory block is required' \
+        unless connection_factory
+      @storage = storage
+      @max_rounds = max_rounds
+      @connection_factory = connection_factory
+    end
+
+    # Opens and reconciles one connection. Pending deletion state from a prior
+    # QUIT interruption is retained until this UIDL reconciliation resolves it.
+    def start_round
+      begin_round(1)
+    end
+
+    # Downloads all not-yet-downloaded messages. Business confirmation remains
+    # the caller's responsibility; this method never sends DELE.
+    def download(max_rounds: @max_rounds)
+      with_round(max_rounds) do |round|
+        round.new_messages.each do |message|
+          yield message, round
+        end
+        round.result
+      end
+    end
+
+    # Sends DELE for confirmed UIDLs and commits the deletion with QUIT.
+    # A failed DELE, failed QUIT, or disconnect is retried from a fresh UIDL
+    # reconciliation and is never reported as committed unless QUIT succeeds.
+    def commit_confirmed(max_rounds: @max_rounds)
+      with_round(max_rounds, &:commit_confirmed)
+    end
+
+    def reset_deletions(max_rounds: 1)
+      with_round(max_rounds, &:reset_deletions)
+    end
+
+    private
+
+    def with_round(max_rounds)
+      attempt = 1
+      round = nil
+      result = nil
+      begin
+        round = begin_round(attempt)
+        result = yield(round)
+      rescue StandardError
+        begin
+          round&.abort
+        rescue StandardError
+        end
+        raise if attempt >= max_rounds
+        attempt += 1
+        retry
+      else
+        round&.close
+        result
+      end
+    end
+
+    def begin_round(attempt)
+      pop = @connection_factory.call(attempt)
+      POP3ResumableRound.new(pop, @storage)
+    end
+  end
 
 
   class POP3Command   #:nodoc: internal use only
