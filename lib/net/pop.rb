@@ -594,17 +594,30 @@ module Net
     # - number counter for bytes
     # - quits the current command, if any
     def do_finish # :nodoc:
+      begin
+        @command.quit if @command
+      ensure
+        close_connection
+      end
+    end
+    private :do_finish
+
+    def close_connection # :nodoc:
       @mails = nil
       @n_mails = nil
       @n_bytes = nil
-      @command.quit if @command
     ensure
       @started = false
       @command = nil
-      @socket.close if @socket
+      if @socket
+        begin
+          @socket.close
+        rescue IOError, SystemCallError
+        end
+      end
       @socket = nil
     end
-    private :do_finish
+    private :close_connection
 
     # Returns the current command.
     #
@@ -706,6 +719,278 @@ module Net
     def set_all_uids   #:nodoc: internal use only (called from POPMail#uidl)
       uidl = command().uidl
       @mails.each {|m| m.uid = uidl[m.number] }
+    end
+
+    # Returns a resumable receiving session for an already started POP3
+    # connection.  See RecoverableSession for the storage protocol.
+    def recoverable_session(store)
+      RecoverableSession.new(self, store)
+    end
+
+    # A UIDL-based POP3 receiving session which separates downloading,
+    # caller-side durable confirmation, DELE marking, and QUIT commit.
+    #
+    # The supplied storage object must implement:
+    #
+    # - confirmed_uids() -> Array[String]: UIDLs durably written by the caller.
+    # - committed_uids() -> Array[String]: UIDLs whose deletion was committed
+    #   by a previous successful QUIT.
+    # - confirm_uid(uidl) -> void: durably record that one message was written.
+    # - marked_deleted_uids() -> Array[String]: UIDLs with successful DELE in
+    #   the current, not yet committed POP3 connection.
+    # - mark_uidl_deleted(uidl) -> void: durably record one successful DELE.
+    # - clear_deleted_marks() -> void: forget all uncommitted DELE marks.
+    # - rollback_deleted_uids(uids) -> void: forget the supplied DELE marks.
+    # - commit_deleted_uids(uids) -> void: durably record that QUIT succeeded
+    #   and the server submitted the deletions.
+    #
+    # A message is never DELEd until +confirm_uid+ has recorded its UIDL.
+    # A successful DELE only creates a mark.  Deletion is committed only after
+    # QUIT returns +OK.  RSET, a network error, or a new connection rolls the
+    # uncommitted marks back; message numbers are always resolved from a fresh
+    # UIDL listing after reconnecting.
+    class RecoverableSession
+      # Raised when a recovery operation is attempted after reconciliation
+      # found that recovery would be unsafe.
+      class Error < POPError
+        def initialize(message = nil, result: nil)
+           super(message || result&.status.to_s)
+           @result = result
+         end
+
+         attr_reader :result
+       end
+
+      # Result of reconciling a connection with caller-side checkpoints.
+      class RecoveryResult
+        def initialize(status, uids: [], duplicate_uids: [],
+                       missing_confirmed_uids: [], error: nil)
+          @status = status.to_sym
+          @uids = Array(uids)
+          @duplicate_uids = Array(duplicate_uids)
+          @missing_confirmed_uids = Array(missing_confirmed_uids)
+          @error = error
+        end
+
+        attr_reader :status, :uids, :duplicate_uids,
+                    :missing_confirmed_uids, :error
+
+        def success?
+          @status == :ok
+        end
+
+        def to_h
+          {
+            status: @status,
+            uids: @uids,
+            duplicate_uids: @duplicate_uids,
+            missing_confirmed_uids: @missing_confirmed_uids,
+            error: @error
+          }
+        end
+      end
+
+      # A downloaded message identified by UIDL rather than its current POP3
+      # sequence number.
+      class RecoverableMail
+        def initialize(pop, number, uidl)
+          @pop = pop
+          @number = number
+          @uidl = uidl
+        end
+
+        attr_reader :uidl, :number
+
+        def pop(dest = +'', &block)
+          if block_given?
+            @pop.send(:command).retr(@number, &block)
+            nil
+          else
+            @pop.send(:command).retr(@number) do |chunk|
+              dest << chunk
+            end
+            dest
+          end
+        end
+      end
+
+      REQUIRED_STORAGE_METHODS = [
+        :confirmed_uids, :committed_uids, :confirm_uid, :marked_deleted_uids,
+        :mark_uidl_deleted, :clear_deleted_marks,
+        :rollback_deleted_uids, :commit_deleted_uids
+      ].freeze
+      private_constant :REQUIRED_STORAGE_METHODS
+
+      def initialize(pop, store)
+        missing = REQUIRED_STORAGE_METHODS.reject {|name| store.respond_to?(name) }
+        unless missing.empty?
+          raise ArgumentError,
+                "recovery store is missing #{missing.join(', ')}"
+        end
+
+        @pop = pop
+        @store = store
+        @uidls = nil
+        @reconciliation = nil
+      end
+
+      attr_reader :reconciliation
+
+      # Refreshes the UIDL listing and compares it with caller checkpoints.
+      # Stale DELE marks from an interrupted previous connection are rolled
+      # back before UIDL is used.
+      def reconcile!
+        return @reconciliation if @reconciliation
+        raise IOError, 'POP session not yet started' unless @pop.started?
+
+        if Array(@store.marked_deleted_uids).any?
+          @store.clear_deleted_marks
+        end
+
+        begin
+          table = @pop.send(:command).uidl
+        rescue StandardError => error
+          @reconciliation = RecoveryResult.new(:uidl_unavailable, error: error)
+          return @reconciliation
+        end
+
+        uidls = {}
+        duplicate_uids = []
+        table.each do |number, uid|
+          unless number.is_a?(Integer) && uid.is_a?(String) && !uid.empty?
+            @reconciliation = RecoveryResult.new(:uidl_unavailable)
+            return @reconciliation
+          end
+          if uidls.key?(uid)
+            duplicate_uids << uid unless duplicate_uids.include?(uid)
+          end
+          uidls[uid] = number
+        end
+
+        present_uids = uidls.keys
+        missing_confirmed_uids = Array(@store.confirmed_uids).uniq -
+                                 present_uids -
+                                 Array(@store.committed_uids).uniq
+
+        status = if duplicate_uids.any?
+                   :duplicate_uidl
+                 elsif missing_confirmed_uids.any?
+                   :missing_confirmed_uidl
+                 else
+                   :ok
+                 end
+
+        @uidls = uidls
+        @reconciliation = RecoveryResult.new(
+          status,
+          uids: present_uids.sort,
+          duplicate_uids: duplicate_uids.sort,
+          missing_confirmed_uids: missing_confirmed_uids.sort
+        )
+      end
+
+      # Yields RecoverableMail objects for messages not confirmed by storage.
+      # Downloading is never followed by DELE automatically.
+      def each_pending
+        return enum_for(:each_pending) unless block_given?
+        ensure_reconciled!
+
+        confirmed = Array(@store.confirmed_uids)
+        @uidls.sort_by {|_, number| number }.each do |uid, number|
+          next if confirmed.include?(uid)
+          yield RecoverableMail.new(@pop, number, uid)
+        end
+      end
+
+      # Downloads one UIDL without changing deletion state.
+      def retrieve(uidl, dest = +'', &block)
+        ensure_reconciled!
+        mail = RecoverableMail.new(@pop, current_number!(uidl), uidl)
+        mail.pop(dest, &block)
+      end
+
+      # Downloads one UIDL and asks the store to durably confirm it.  DELE is
+      # still sent only by an explicit delete_confirmed call.
+      def receive(uidl, dest = +'', &block)
+        message = retrieve(uidl, dest, &block)
+        @store.confirm_uid(uidl)
+        message
+      end
+
+      # Sends DELE for every confirmed UIDL currently listed by the server.
+      # Each successful DELE is immediately recorded as a mark.  If a later
+      # DELE fails, marks from this connection are rolled back.
+      def delete_confirmed
+        ensure_reconciled!
+        uids = Array(@store.confirmed_uids).uniq.select {
+          |uid| @uidls.key?(uid)
+        }.sort_by {|uid| @uidls[uid] }
+
+        begin
+          uids.each do |uid|
+            next if Array(@store.marked_deleted_uids).include?(uid)
+            @pop.send(:command).dele(@uidls.fetch(uid))
+            @store.mark_uidl_deleted(uid)
+          end
+        rescue Exception
+          rollback_all_marks
+          raise
+        end
+
+        RecoveryResult.new(:ok, uids: Array(@store.marked_deleted_uids).dup)
+      end
+
+      # Sends RSET and, only after +OK, removes local DELE marks.  A failed
+      # RSET or broken connection leaves the caller connected to a dead command
+      # and does not report the marks as cleared.
+      def reset
+        ensure_reconciled!
+        @pop.send(:command).rset
+        @store.clear_deleted_marks
+        true
+      end
+
+      # Commits marked deletions with QUIT.  If QUIT does not return +OK, all
+      # local DELE marks are rolled back.  +OK followed by durable storage
+      # commit is the only state reported as deleted.
+      def finish
+        ensure_reconciled!
+        marked = Array(@store.marked_deleted_uids).dup
+        quit_succeeded = false
+
+        begin
+          @pop.send(:command).quit
+          quit_succeeded = true
+        ensure
+          @pop.send(:close_connection)
+        end
+
+        @store.commit_deleted_uids(marked)
+        RecoveryResult.new(:ok, uids: marked)
+      rescue Exception
+        rollback_all_marks unless quit_succeeded
+        raise
+      end
+
+      private
+
+      def ensure_reconciled!
+        result = reconcile!
+        return result if result.success?
+        raise Error.new("unsafe recovery state: #{result.status}",
+                       result: result)
+      end
+
+      def current_number!(uidl)
+        @uidls.fetch(uidl) do
+          raise IndexError, "UIDL not present on server: #{uidl}"
+        end
+      end
+
+      def rollback_all_marks
+        marked = Array(@store.marked_deleted_uids)
+        @store.rollback_deleted_uids(marked) if marked.any?
+      end
     end
 
     # debugging output for +msg+
