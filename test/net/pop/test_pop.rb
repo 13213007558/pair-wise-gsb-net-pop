@@ -5,7 +5,7 @@ require 'digest/md5'
 
 class TestPOP < Test::Unit::TestCase
   def setup
-    @users = {'user' => 'pass' }
+    @users = {'user' => 'pass', 'möter' => 'päss' }
     @ok_user = 'user'
     @stamp_base = "#{$$}.#{Time.now.to_i}@localhost"
   end
@@ -72,6 +72,101 @@ class TestPOP < Test::Unit::TestCase
     end
   end
 
+  def test_utf8_user_auth
+    commands = pop_test(false, utf8_capa: true) do |pop|
+      pop.start('möter', @users['möter'], utf8: true)
+      assert_predicate pop, :utf8?
+      assert_predicate pop, :utf8_user?
+    end
+
+    assert_equal [
+      "CAPA\r\n".b,
+      "UTF8 ON\r\n".b,
+      "USER m\xC3\xB6ter\r\n".b,
+      "PASS p\xC3\xA4ss\r\n".b,
+    ], commands
+  end
+
+  def test_utf8_mode_does_not_send_utf8_user_for_ascii_account
+    commands = pop_test(false, utf8_capa: true) do |pop|
+      pop.start(@ok_user, @users[@ok_user], utf8: true)
+    end
+
+    assert_equal [
+      "CAPA\r\n".b,
+      "UTF8 ON\r\n".b,
+      "USER user\r\n".b,
+      "PASS pass\r\n".b,
+    ], commands
+  end
+
+  def test_non_ascii_user_requires_utf8_user_capability
+    commands = pop_test(false, utf8_capa: :utf8) do |pop|
+      error = assert_raise Net::POPUTF8Error do
+        pop.start('möter', @users['möter'], utf8: true)
+      end
+      assert_equal 'POP3 UTF8 USER capability is required for UTF-8 accounts',
+                   error.message
+    end
+
+    assert_equal ["CAPA\r\n".b, "UTF8 ON\r\n".b], commands
+  end
+
+  def test_server_rejection_preserves_reason
+    commands = pop_test(false, reject_utf8: true) do |pop|
+      error = assert_raise Net::POPUTF8Error do
+        pop.start(@ok_user, @users[@ok_user], utf8: true)
+      end
+      assert_equal '-ERR UTF8 unavailable: policy', error.message
+    end
+
+    assert_equal ["CAPA\r\n".b, "UTF8 ON\r\n".b], commands
+  end
+
+  def test_invalid_utf8_account_does_not_negotiate
+    commands = pop_test(false, utf8_capa: true) do |pop|
+      assert_raise Encoding::InvalidByteSequenceError do
+        pop.start("m\xffter".b, 'pass', utf8: true)
+      end
+    end
+
+    assert_empty commands
+  end
+
+  def test_invalid_utf8_password_does_not_negotiate
+    commands = pop_test(false, utf8_capa: true) do |pop|
+      assert_raise Encoding::InvalidByteSequenceError do
+        pop.start(@ok_user, "p\xffss".b, utf8: true)
+      end
+    end
+
+    assert_empty commands
+  end
+
+  def test_default_login_does_not_negotiate_utf8
+    commands = pop_test(false, utf8_capa: true) do |pop|
+      pop.start(@ok_user, @users[@ok_user])
+    end
+
+    assert_equal [
+      "USER user\r\n".b,
+      "PASS pass\r\n".b,
+    ], commands
+  end
+
+  def test_apop_digest_semantics_are_unchanged_with_utf8_mode
+    commands = pop_test(@stamp_base, utf8_capa: true) do |pop|
+      pop.start(@ok_user, @users[@ok_user], utf8: true)
+    end
+
+    digest = Digest::MD5.hexdigest("<#{@stamp_base}>#{@users[@ok_user]}")
+    assert_equal [
+      "CAPA\r\n".b,
+      "UTF8 ON\r\n".b,
+      "APOP user #{digest}\r\n".b,
+    ], commands
+  end
+
   def test_pop_pass_crlf_injection
     pop_test(false) do |pop|
       assert_raise ArgumentError do
@@ -111,20 +206,47 @@ class TestPOP < Test::Unit::TestCase
     res = popmail.pop
     assert_equal "[ruby-core:85210]\r\n[Bug #14416]\r\n", res
     assert_not_predicate res, :frozen?
+    assert_equal Encoding::ASCII_8BIT, res.encoding
 
     res = popmail.top(1)
     assert_equal "[ruby-core:85210]\r\n", res
     assert_not_predicate res, :frozen?
+    assert_equal Encoding::ASCII_8BIT, res.encoding
   end
 
-  def pop_test(apop=false)
+  def test_popmail_preserves_raw_utf8_bytes
+    raw = "Subject: ä\r\n\r\n\xff\r\n".b
+    command = Object.new
+    def command.retr(_number)
+      yield "Subject: ä\r\n".b
+      yield "\r\n".b
+      yield "\xff\r\n".b
+    end
+    def command.top(_number, _lines)
+      yield "Subject: ä\r\n".b
+      yield "\xff\r\n".b
+    end
+
+    popmail = Net::POPMail.new(1, raw.bytesize, :unused, command)
+    res = popmail.pop
+
+    assert_equal raw, res
+    assert_equal Encoding::ASCII_8BIT, res.encoding
+    res = popmail.top(0)
+    assert_equal "Subject: ä\r\n\xff\r\n".b, res
+    assert_equal Encoding::ASCII_8BIT, res.encoding
+  end
+
+  def pop_test(apop=false, utf8_capa: false, reject_utf8: false)
     host = 'localhost'
     server = TCPServer.new(host, 0)
     port = server.addr[1]
+    commands = []
     server_thread = Thread.start do
       sock = server.accept
       begin
-        pop_server_loop(sock, apop)
+        pop_server_loop(sock, apop, utf8_capa: utf8_capa,
+                        reject_utf8: reject_utf8, commands: commands)
       ensure
         sock.close
       end
@@ -147,9 +269,11 @@ class TestPOP < Test::Unit::TestCase
       end
     end
     assert_join_threads([client_thread, server_thread])
+    commands
   end
 
-  def pop_server_loop(sock, apop)
+  def pop_server_loop(sock, apop, utf8_capa: false, reject_utf8: false,
+                      commands: nil)
     if apop
       sock.print "+OK ready <#{apop}>\r\n"
     else
@@ -157,7 +281,22 @@ class TestPOP < Test::Unit::TestCase
     end
     user = nil
     while line = sock.gets
+      commands << line.b if commands
       case line
+      when /^CAPA\r\n/
+        sock.print "+OK Capability list follows\r\n"
+        if utf8_capa == :utf8
+          sock.print "UTF8\r\n"
+        elsif utf8_capa
+          sock.print "UTF8 USER\r\n"
+        end
+        sock.print ".\r\n"
+      when /^UTF8 ON\r\n/
+        if reject_utf8
+          sock.print "-ERR UTF8 unavailable: policy\r\n"
+        else
+          sock.print "+OK UTF8 enabled\r\n"
+        end
       when /^USER (.+)\r\n/
         user = $1
         if @users.key?(user)

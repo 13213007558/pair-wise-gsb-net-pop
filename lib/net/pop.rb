@@ -39,6 +39,9 @@ module Net
   # POP3 authentication error.
   class POPAuthenticationError < ProtoAuthError; end
 
+  # POP3 UTF8 mode negotiation error.
+  class POPUTF8Error < POPError; end
+
   # Unexpected response from the server.
   class POPBadResponse < POPError; end
 
@@ -261,8 +264,8 @@ module Net
     #
     def POP3.foreach(address, port = nil,
                      account = nil, password = nil,
-                     isapop = false, &block)  # :yields: message
-      start(address, port, account, password, isapop) {|pop|
+                     isapop = false, utf8: false, &block)  # :yields: message
+      start(address, port, account, password, isapop, utf8: utf8) {|pop|
         pop.each_mail(&block)
       }
     end
@@ -282,8 +285,8 @@ module Net
     #
     def POP3.delete_all(address, port = nil,
                         account = nil, password = nil,
-                        isapop = false, &block)
-      start(address, port, account, password, isapop) {|pop|
+                        isapop = false, utf8: false, &block)
+      start(address, port, account, password, isapop, utf8: utf8) {|pop|
         pop.delete_all(&block)
       }
     end
@@ -304,8 +307,8 @@ module Net
     #
     def POP3.auth_only(address, port = nil,
                        account = nil, password = nil,
-                       isapop = false)
-      new(address, port, isapop).auth_only account, password
+                       isapop = false, utf8: false)
+      new(address, port, isapop, utf8: utf8).auth_only account, password
     end
 
     # Starts a pop3 session, attempts authentication, and quits.
@@ -400,8 +403,8 @@ module Net
     #
     def POP3.start(address, port = nil,
                    account = nil, password = nil,
-                   isapop = false, &block)   # :yield: pop
-      new(address, port, isapop).start(account, password, &block)
+                   isapop = false, utf8: false, &block)   # :yield: pop
+      new(address, port, isapop, utf8: utf8).start(account, password, &block)
     end
 
     # Creates a new POP3 object.
@@ -413,12 +416,17 @@ module Net
     # The optional +isapop+ specifies whether this connection is going
     # to use APOP authentication; it defaults to +false+.
     #
+    # Set +utf8+ to true to negotiate RFC 6856 UTF8 mode before
+    # authentication.
+    #
     # This method does *not* open the TCP connection.
-    def initialize(addr, port = nil, isapop = false)
+    def initialize(addr, port = nil, isapop = false, utf8: false)
       @address = addr
       @ssl_params = POP3.ssl_params
       @port = port
       @apop = isapop
+      @utf8 = utf8
+      @utf8_user = false
 
       @command = nil
       @socket = nil
@@ -435,6 +443,16 @@ module Net
     # Does this instance use APOP authentication?
     def apop?
       @apop
+    end
+
+    # Whether this connection negotiates RFC 6856 UTF8 mode.
+    def utf8?
+      @utf8
+    end
+
+    # Whether the negotiated UTF8 mode permits UTF-8 mailbox names.
+    def utf8_user?
+      @utf8_user
     end
 
     # does this instance use SSL?
@@ -523,23 +541,24 @@ module Net
     # closes the session after block call finishes.
     #
     # This method raises a POPAuthenticationError if authentication fails.
-    def start(account, password) # :yield: pop
+    # Set +utf8+ to true to negotiate RFC 6856 UTF8 mode first.
+    def start(account, password, utf8: @utf8) # :yield: pop
       raise IOError, 'POP session already started' if @started
       if block_given?
         begin
-          do_start account, password
+          do_start account, password, utf8
           return yield(self)
         ensure
           do_finish
         end
       else
-        do_start account, password
+        do_start account, password, utf8
         return self
       end
     end
 
     # internal method for Net::POP3.start
-    def do_start(account, password) # :nodoc:
+    def do_start(account, password, utf8) # :nodoc:
       s = Timeout.timeout(@open_timeout, Net::OpenTimeout) do
         TCPSocket.open(@address, port)
       end
@@ -562,11 +581,13 @@ module Net
       on_connect
       @command = POP3Command.new(@socket)
       if apop?
-        @command.apop account, password
+        @command.apop account, password, utf8: utf8
       else
-        @command.auth account, password
+        @command.auth account, password, utf8: utf8
       end
       @started = true
+      @utf8 = @command.utf8?
+      @utf8_user = @command.utf8_user?
     ensure
       # Authentication failed, clean up connection.
       unless @started
@@ -597,6 +618,7 @@ module Net
       @mails = nil
       @n_mails = nil
       @n_bytes = nil
+      @utf8_user = false
       @command.quit if @command
     ensure
       @started = false
@@ -804,6 +826,7 @@ module Net
         @command.retr(@number, &block)
         nil
       else
+        dest.force_encoding(Encoding::ASCII_8BIT)
         @command.retr(@number) do |chunk|
           dest << chunk
         end
@@ -820,6 +843,7 @@ module Net
     #
     # This method raises a POPError if an error occurs.
     def top(lines, dest = +'')
+      dest.force_encoding(Encoding::ASCII_8BIT)
       @command.top(@number, lines) do |chunk|
         dest << chunk
       end
@@ -891,27 +915,50 @@ module Net
     def initialize(sock)
       @socket = sock
       @error_occurred = false
+      @utf8 = false
+      @utf8_user = false
       res = check_response(critical { recv_response() })
       @apop_stamp = res.slice(/<[!-~]+@[!-~]+>/)
     end
 
     attr_reader :socket
 
+    def utf8_user?
+      @utf8_user
+    end
+
+    def utf8?
+      @utf8
+    end
+
     def inspect
       +"#<#{self.class} socket=#{@socket}>"
     end
 
-    def auth(account, password)
+    def auth(account, password, utf8: false)
+      if utf8
+        account = utf8_string(account, 'account')
+        password = utf8_string(password, 'password')
+      end
       check_response_auth(critical {
+        if utf8
+          enable_utf8
+          ensure_utf8_account(account)
+        end
         check_response_auth(get_response('USER %s', account))
         get_response('PASS %s', password)
       })
     end
 
-    def apop(account, password)
+    def apop(account, password, utf8: false)
       raise POPAuthenticationError, 'not APOP server; cannot login' \
                                                       unless @apop_stamp
+      account = utf8_string(account, 'account') if utf8
       check_response_auth(critical {
+        if utf8
+          enable_utf8
+          ensure_utf8_account(account)
+        end
         get_response('APOP %s %s',
                      account,
                      Digest::MD5.hexdigest(@apop_stamp + password))
@@ -982,6 +1029,59 @@ module Net
     end
 
     private
+
+    def enable_utf8
+      capabilities = retrieve_capabilities
+      unless capabilities.include?('UTF8')
+        raise POPUTF8Error,
+              'POP3 UTF8 mode is not supported by the server'
+      end
+
+      @socket.writeline validate_line('UTF8 ON')
+      res = recv_response()
+      unless /\A\+OK/i =~ res
+        raise POPUTF8Error, res
+      end
+
+      @utf8 = true
+      @utf8_user = capabilities.include?('UTF8 USER')
+    end
+
+    def ensure_utf8_account(account)
+      unless account.ascii_only? || @utf8_user
+        raise POPUTF8Error,
+              'POP3 UTF8 USER capability is required for UTF-8 accounts'
+      end
+    end
+
+    def retrieve_capabilities
+      @socket.writeline validate_line('CAPA')
+      res = recv_response()
+      unless /\A\+OK/i =~ res
+        raise POPUTF8Error, res
+      end
+
+      capabilities = []
+      @socket.each_list_item do |line|
+        tokens = line.chomp("\r").split(/[ \t]+/)
+        next unless tokens.first == 'UTF8'
+        capabilities << 'UTF8'
+        capabilities << 'UTF8 USER' if tokens[1] == 'USER'
+      end
+      capabilities
+    end
+
+    def utf8_string(value, name)
+      value = value.to_str
+      if value.encoding == Encoding::ASCII_8BIT
+        value = value.dup.force_encoding(Encoding::UTF_8)
+      end
+      unless value.valid_encoding?
+        raise Encoding::InvalidByteSequenceError,
+              "invalid UTF-8 byte sequence in POP3 #{name}"
+      end
+      value.encode(Encoding::UTF_8)
+    end
 
     def getok(fmt, *fargs)
       @socket.writeline validate_line(sprintf(fmt, *fargs))
